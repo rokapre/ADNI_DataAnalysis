@@ -1,0 +1,495 @@
+---
+title: 'ADNI Neuroimaging Data Analysis Part 2: Following Baseline LMCI Patients'
+author: "Rohan Kapre"
+date: "3/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Question: Do MCI patients in higher P(AD) bins have a worse cognitive outcome?
+
+In this section, we investigate whether MCI (mild cognitive impairment) patients who had a higher predicted probability from the logistic regression trained on log transformed & scaled lipidomic/MRI data have a worse cognitive outcome. Recall that the predicted probabilities were binned into [0,0.2),[0.2-0.4),[0.4,0.6),[0.6,0.8),[0.8,1.0) bins for P(AD). Refer to Part 1 for more information. 
+
+We will be examining 5 different outcomes (4 ADNI specific, 1 MMSE) listed below. The ADNI specific scores range from -4 to 4 with higher being better. MMSE ranges from 0-30 with higher also being better. For MMSE, 20-24 is mild dementia, 13-20 is moderate, <13 is severe. 
+
+ADNI-MEM = ADNI memory score
+
+ADNI-EF = ADNI executive function score
+
+ADNI-LAN = ADNI language score
+
+ADNI-VS = ADNI visuospatial ability score
+
+MMSE = Mini Mental State Examination (30 questions)
+
+However, in the case of MMSE, we will actually use the number of errors on the exam (30-MMSE) as the outcome in order to treat this as a discrete count to analyze.
+
+The analysis will consist of looking at these metrics at baseline as well as their slopes longitudinally. We will perform pairwise constrasts between the 5 probability bins for each outcome $choose(5,2) = 10$, and with 5 outcomes at both baseline and longitudinal this leads to 100 tests in total. To account for multiple comparisons, we will use the Benjamini-Yekutieli False Discovery Rate (FDR) control method. 
+
+
+## Data Preparation 
+
+Below, we preprocess the longitudinal data for analysis by joining it to the probabilities of AD for the MCI patients. Additionally, dates in the dataset are converted to times in years from baseline. The patients were followed approximately every 0.5 years (6 months) up until 11 years, at which point they were followed approximately yearly. Time will be treated continuously in the analyses later on since the exact timings are different per patient. Age and education years were also centered based on the full baseline data. 
+
+
+```{r,message=FALSE}
+
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(forcats)
+library(lubridate)
+library(ggplot2)
+library(rlang)
+library(purrr)
+
+library(mgcv)
+library(emmeans)
+
+MCIdata = read_csv("MCIdata_withADprobs.csv")
+
+rawlongdata = read_csv("ADNI_longitudinal.csv")
+
+baseMCIprobdata = MCIdata %>% select(RID,ProbAD,BinAD)
+
+unique(rawlongdata$VISCODE)
+vistimes = c(seq(0,132,6),144,156,168)
+m = rep("m",length(vistimes))
+visits_ordered = paste(m,vistimes,sep="")
+visits_ordered[1] = "bl"
+visits_ordered[2] = "m06"
+visits_ordered
+
+longdata = rawlongdata %>% mutate(VISCODE=as_factor(VISCODE),
+                                  VISCODE = fct_relevel(VISCODE,visits_ordered),
+                                  EXAMDATE = as_date(EXAMDATE,format="%m/%d/%Y"),
+                                  APOE4 = as_factor(APOE4),
+                                  revMMSE = 30-MMSE) %>% arrange(RID,VISCODE)
+
+base_examdates = longdata %>% filter(VISCODE=="bl") %>% select(RID,EXAMDATE) %>%
+  rename(BASEDATE=EXAMDATE)
+
+longdata = longdata %>% inner_join(base_examdates,by="RID") %>% 
+  mutate(Time=time_length(EXAMDATE-BASEDATE,unit="years")) %>%
+  relocate(BASEDATE,Time,.before=DX_bl)
+
+longdata = longdata %>% mutate(AGE_CENTER = AGE-mean(AGE),
+                               PTEDUCAT_CENTER = PTEDUCAT-mean(PTEDUCAT))
+
+basedata = longdata %>% filter(VISCODE=="bl")
+
+baseMCIdata = basedata %>% filter(DX_bl=="LMCI") %>% inner_join(baseMCIprobdata,by="RID") %>%
+  mutate(BinAD=as_factor(BinAD),
+         BinAD = fct_relevel(BinAD,"[0.0, 0.2)","[0.2, 0.4)","[0.4, 0.6)","[0.6, 0.8)","[0.8, 1.0)"),
+         RID = as_factor(RID))
+
+```
+
+## Summary Stats for Demographics/Covariates and Cognitive Outcome in Full Baseline Data
+
+Before proceeding to the main analysis we will first investigate some of the demographics in the full baseline dataset (including CN, AD, and LMCI patients). 
+
+```{r}
+
+basedata %>% group_by(DX_bl) %>% summarise(N=n(),meanAGE=mean(AGE),meanEDU=mean(PTEDUCAT),
+                                                 meanADNI_MEM = mean(ADNI_MEM),meanADNI_EF=mean(ADNI_EF),
+                                                 meanADNI_LAN = mean(ADNI_LAN),meanADNI_VS=mean(ADNI_VS),
+                                                  meanMMSE = mean(MMSE)) %>%
+  kable(caption="Full Baseline Data Age, Education, and mean baseline cognitive measures")
+
+```
+
+
+From above, it is clear that  patients with AD tend to score much lower in all the cognitive measures than both LMCI and CN, while LMCI scores in between. Age is approximately the same in all 3 groups and education years is only slightly lower for AD and MCI than CN. 
+
+```{r,message=FALSE,warnings=FALSE}
+kable(table(basedata$DX_bl,basedata$PTETHCAT),caption="Full Data: Baseline Diagnosis vs Ethnicity")
+
+kable(table(basedata$DX_bl,basedata$PTGENDER),caption="Full Data: Baseline Diagnosis vs Gender")
+
+kable(prop.table(table(baseMCIdata$BinAD,baseMCIdata$PTGENDER),1),caption="LMCI Data: AD Bin vs Gender")
+
+```
+
+Most patients are not hispanic/latino, in all 3 categories, and thus we do not include ethnicity as a predictor. All 3 categories appear to  have more males represented. Within the LMCI patients and the bins, the proportion of males and females is roughly the same across. 
+
+
+```{r,message=FALSE,warnings=FALSE}
+kable(prop.table(table(basedata$DX_bl,basedata$APOE4),1),caption="Full Data: Baseline Diagnosis vs APOE4")
+
+kable(prop.table(table(baseMCIdata$BinAD,baseMCIdata$APOE4),1),caption="LMCI Data: AD Bin vs APOE4")
+
+```
+
+Presence of APOE4 allele is a known risk factor for AD, and it does appear that there is a greater proportion of patients with 1 or 2 APOE4 alleles in AD and LMCI vs CN. Within LMCI however, the proportion of patients with 1 or 2 APOE4 alleles does not appear to correlate with the bin. 
+
+# Baseline Outcome Investigation 
+
+In this section, we examine each outcome at baseline. For the modeling, a Penalized GAM (Generalized Additive Model) from the mgcv package with spline terms (3 df) for continuous centered Age and Education is used in addition to linear terms. This is to adjust for possible nonlinearities in cognitive outcome vs age and education. Additionally, we include APOE4 main effect terms as well as up to a 3 factor interaction with centered Age and the P(AD) bin. This is to account for the fact that the effect of APOE4 may be different depending on the biochemical features used to construct the P(AD) bins, and may be different based on age. Similarly, the biochemical features may have a different impact depending on age as well. 
+
+For each of the ADNI outcomes, a normal identity link GAM was used, while for MMSE it was converted to revMMSE=30-MMSE for use with a negative binomial GAM and log link. 
+
+This section will show the plots and baseline means for each cognitive outcome, pairwise contrasts/hypothesis testing will be done in the very end. Below is the wrapper function for the boxplots at baseline and the model fitting. For convenience to save time when knitting this document though, we load the models that were fitted outside of this document. 
+
+```{r}
+
+
+
+fit_baseline_GAM = function(response,data,family=gaussian(link=identity)){
+  response = enexpr(response)
+  data = enexpr(data)
+  family=enexpr(family)
+  model_call = expr(gam(!!response~PTGENDER+PTEDUCAT_CENTER+
+                s(PTEDUCAT_CENTER,k=3)+s(AGE_CENTER,k=3)+AGE_CENTER*APOE4*BinAD,family=!!family,data=!!data))
+  model = eval_tidy(model_call,env=caller_env())
+  return(model)
+  
+}
+
+plot_baseline = function(data,response,group){
+  response = enexpr(response)
+  group = enexpr(group)
+  p = ggplot(data,aes(x=!!group,y=!!response,fill=!!group)) + geom_boxplot() + theme_bw()
+  return(p)
+}
+
+
+```
+
+
+## Baseline ADNI-MEM 
+
+```{r,message=FALSE,warning=FALSE}
+
+ADNI_MEM_dxplot = plot_baseline(basedata,ADNI_MEM,DX_bl)
+ADNI_MEM_binplot = plot_baseline(baseMCIdata,ADNI_MEM,BinAD)
+
+ADNI_MEM_dxplot
+
+ADNI_MEM_binplot
+
+#Base_ADNI_MEM = fit_baseline_GAM(ADNI_MEM,baseMCIdata)
+#saveRDS(Base_ADNI_MEM,file="Base_ADNI_MEM.rdata")
+Base_ADNI_MEM = readRDS("Base_ADNI_MEM.rdata")
+emm_MEM=emmeans(Base_ADNI_MEM,pairwise~BinAD,adjust="none")
+comp_MEM = as_tibble(emm_MEM$contrasts) %>% mutate(response="ADNI_MEM",type="Baseline")
+
+emm_MEM$emmeans %>% as_tibble() %>% kable(caption="Baseline ADNI-MEM by P(AD) bin")
+
+```
+From the above, it appears that as the P(AD) bin increases, the mean memory functioning as assessed by ADNI-MEM tends to worsen (decrease). Note that corrected pairwise comparisons will be performed in the very end. 
+
+## Baseline ADNI-EF
+
+```{r,message=FALSE,warning=FALSE}
+
+ADNI_EF_dxplot = plot_baseline(basedata,ADNI_EF,DX_bl)
+ADNI_EF_binplot = plot_baseline(baseMCIdata,ADNI_EF,BinAD)
+
+ADNI_EF_dxplot
+ADNI_EF_binplot 
+
+#Base_ADNI_EF = fit_baseline_GAM(ADNI_EF,baseMCIdata)
+#saveRDS(Base_ADNI_EF,file="Base_ADNI_EF.rdata")
+Base_ADNI_EF = readRDS("Base_ADNI_EF.rdata")
+emm_EF=emmeans(Base_ADNI_EF,pairwise~BinAD,adjust="none")
+comp_EF = as_tibble(emm_EF$contrasts) %>% mutate(response="ADNI_EF",type="Baseline")
+
+emm_EF$emmeans %>% as_tibble() %>% kable(caption="Baseline ADNI-EF by P(AD) bin")
+
+```
+
+
+For executive functioning, the mean ADNI-EF worsens with increased P(AD) bin, with the greatest change going from the 0.6-0.8 bin to the 0.8-1.0 bin. 
+
+## Baseline ADNI-LAN 
+
+```{r,message=FALSE,warning=FALSE}
+
+ADNI_LAN_dxplot = plot_baseline(basedata,ADNI_LAN,DX_bl)
+ADNI_LAN_binplot = plot_baseline(baseMCIdata,ADNI_LAN,BinAD)
+
+ADNI_LAN_dxplot
+ADNI_LAN_binplot 
+
+#Base_ADNI_LAN = fit_baseline_GAM(ADNI_LAN,baseMCIdata)
+#saveRDS(Base_ADNI_LAN,file="Base_ADNI_LAN.rdata")
+Base_ADNI_LAN = readRDS("Base_ADNI_LAN.rdata")
+emm_LAN=emmeans(Base_ADNI_LAN,pairwise~BinAD,adjust="none")
+comp_LAN = as_tibble(emm_LAN$contrasts) %>% mutate(response="ADNI_LAN",type="Baseline")
+
+emm_LAN$emmeans %>% as_tibble() %>% kable(caption="Baseline ADNI-LAN by P(AD) bin")
+
+```
+
+A similar trend is seen in ADNI-LAN, but here the greatest change occurs from the lowest bin [0,0.2) to [0.2,0.4) and from [0.6,0.8) to [0.8,1.0). Overall, it does appear that the predicted probability from the lipid/MRI features correlate to the cognitive outcome. 
+
+## Baseline ADNI-VS 
+
+```{r}
+
+ADNI_VS_dxplot = plot_baseline(basedata,ADNI_VS,DX_bl)
+ADNI_VS_binplot = plot_baseline(baseMCIdata,ADNI_VS,BinAD)
+
+ADNI_VS_dxplot
+ADNI_VS_binplot 
+
+#Base_ADNI_VS = fit_baseline_GAM(ADNI_VS,baseMCIdata)
+#saveRDS(Base_ADNI_VS,file="Base_ADNI_VS.rdata")
+Base_ADNI_VS = readRDS("Base_ADNI_VS.rdata")
+emm_VS = emmeans(Base_ADNI_VS,pairwise~BinAD,adjust="none")
+comp_VS = as_tibble(emm_VS$contrasts) %>% mutate(response="ADNI_VS",type="Baseline")
+
+emm_VS$emmeans %>% as_tibble() %>% kable(caption="Baseline ADNI-VS by P(AD) bin")
+
+
+```
+
+
+In the case of visuopatial functioning, things are less clear. There is a slight trend from the lowest group to the highest group but it is not very strong. 
+
+## Baseline MMSE Errors 
+
+Note the below is actually the number of errors on the MMSE exam, so higher is WORSE. And in this case, a negative binomial GAM is used to model the count data. 
+
+```{r}
+
+revMMSE_dxplot = plot_baseline(basedata,revMMSE,DX_bl)
+revMMSE_binplot = plot_baseline(baseMCIdata,revMMSE,BinAD)
+
+revMMSE_dxplot
+revMMSE_binplot
+
+
+#Base_revMMSE = fit_baseline_GAM(revMMSE,baseMCIdata,family = nb(link=log))
+#saveRDS(Base_revMMSE,file="Base_revMMSE.rdata")
+Base_revMMSE = readRDS("Base_revMMSE.rdata")
+emm_revMMSE = emmeans(Base_revMMSE,pairwise~BinAD,transform="response",adjust="none")
+comp_revMMSE = as_tibble(emm_revMMSE$contrasts) %>% mutate(response="revMMSE",type="Baseline")
+
+emm_revMMSE$emmeans %>% as_tibble() %>% kable(caption="Baseline MMSE errors vs P(AD) bin")
+
+```
+
+The number of errors on baseline MMSE does appear to increase with the bin from about 2 to 3-4, although the trend is weak at baseline. 
+
+Overall, we see that the bins do correlate with worsening cognitive outcome in terms of the means, but it remains to see (after the next longitudinal section) which trends are statistically significant (accounting for multiple comparisons)
+
+# Longitudinal Outcome Investigation 
+
+In this section, we examine the binned LMCI patients over time and compare the rate of change of their cognition metrics per year. 
+
+The model used here is a Penalized Mixed GAM with terms similar to above, except this time including random effects intercept and time slope for the RID,linear and spline (df=3) terms for centered age, centered education years as well as up to a 4 factor interaction of time with centered age, APOE4,and bin.
+
+Following this section, we will perform the FDR corrected multiple comparisons for 100 tests across all the outcomes including the baseline ones. 
+
+Note that the plots in this section display the fitted LMM per RID, and only for 35 sampled RIDs per group so as to avoid cluttering the plot. 
+
+
+```{r}
+
+longMCIdata = longdata %>% filter(DX_bl=="LMCI") %>% inner_join(baseMCIprobdata,by="RID") %>%
+  mutate(BinAD=as_factor(BinAD),
+         BinAD = fct_relevel(BinAD,"[0.0, 0.2)","[0.2, 0.4)","[0.4, 0.6)","[0.6, 0.8)","[0.8, 1.0)"),
+         RID = as_factor(RID))
+
+
+fit_longitudinal_GAM = function(response,data,family=gaussian(link=identity)){
+  response = enexpr(response)
+  data = enexpr(data)
+  family = enexpr(family)
+  model_call = expr(gam(!!response~s(RID,bs="re")+s(RID,Time,bs="re")+PTGENDER+PTEDUCAT_CENTER+s(PTEDUCAT_CENTER,k=3)+
+                          s(AGE_CENTER,k=3)+AGE_CENTER*APOE4*BinAD*Time,family=!!family,data=!!data))
+  model = eval_tidy(model_call,env=caller_env())
+  return(model)
+}
+
+plot_longitudinal_samples = function(data,model,n_pergroup){
+
+  sampdata = data %>% group_by(RID,BinAD) %>% nest() %>% group_by(BinAD) %>%
+    slice_sample(n=n_pergroup) %>% unnest(cols=c(data))
+  
+  response = str_trim(str_split(deparse(formula(model))[1],"~")[[1]][1])
+  new_response = paste(response,"_hat",sep="")
+  
+  sampdata[[new_response]] = predict(model,sampdata)
+  
+  response = as.symbol(response)
+  new_response = as.symbol(new_response)
+  
+  p = ggplot(sampdata,aes(x=Time,y=!!response,group=RID,col=BinAD)) +
+    geom_point() + geom_line(inherit.aes=FALSE,aes(x=Time,y=!!new_response,group=RID,col=BinAD)) + 
+    theme_bw()
+  
+  return(p)
+}
+
+```
+
+
+## Longitudinal ADNI-MEM 
+
+```{r,warning=FALSE,message=FALSE}
+
+#LMM_ADNI_MEM = fit_longitudinal_GAM(ADNI_MEM,longMCIdata)
+#saveRDS(LMM_ADNI_MEM,file="LMM_ADNI_MEM.rdata")
+LMM_ADNI_MEM = readRDS("LMM_ADNI_MEM.rdata")
+emm_long_MEM = emtrends(LMM_ADNI_MEM,pairwise~BinAD,var="Time",adjust="none")
+comps_long_MEM = as_tibble(emm_long_MEM$contrasts) %>% mutate(response="ADNI_MEM",type="TimeSlope")
+
+set.seed(100)
+plot_longitudinal_samples(longMCIdata,LMM_ADNI_MEM,35)
+
+emm_long_MEM$emtrends %>% as_tibble() %>% kable(caption="Slope of ADNI-MEM over time (yr)")
+
+```
+While not perfectly monotonic, there is a trend for ADNI-MEM to worsen faster in the higher P(AD) bins. The sharp contrast is more visible in the plot, where the red (lowest) bin stays about the same or even improves while the blue and magenta (highest) tend to quickly decline 
+
+## Longitudinal ADNI-EF 
+
+```{r,warning=FALSE,message=FALSE}
+
+#LMM_ADNI_EF = fit_longitudinal_GAM(ADNI_EF,longMCIdata)
+#saveRDS(LMM_ADNI_EF,file="LMM_ADNI_EF.rdata")
+LMM_ADNI_EF = readRDS("LMM_ADNI_EF.rdata")
+emm_long_EF = emtrends(LMM_ADNI_EF,pairwise~BinAD,var="Time",adjust="none")
+comps_long_EF = as_tibble(emm_long_EF$contrasts) %>% mutate(response="ADNI_EF",type="TimeSlope")
+
+
+set.seed(110)
+plot_longitudinal_samples(longMCIdata,LMM_ADNI_EF,35)
+
+emm_long_EF$emtrends %>% as_tibble() %>% kable(caption="Slope of ADNI-EF over time (yr)")
+
+
+```
+
+
+As the bin increases, the decrease in executive functioning as assessed by ADNI-EF appears to be amplified, though the change is most aparrant between the lowest (red) and highest groups (blue and magenta)
+
+## Longitudinal ADNI-LAN 
+
+```{r,warning=FALSE,message=FALSE}
+
+#LMM_ADNI_LAN = fit_longitudinal_GAM(ADNI_LAN,longMCIdata)
+#saveRDS(LMM_ADNI_LAN,file="LMM_ADNI_LAN.rdata")
+LMM_ADNI_LAN = readRDS("LMM_ADNI_LAN.rdata")
+emm_long_LAN = emtrends(LMM_ADNI_LAN,pairwise~BinAD,var="Time",adjust="none")
+comps_long_LAN = as_tibble(emm_long_LAN$contrasts) %>% mutate(response="ADNI_LAN",type="TimeSlope")
+
+set.seed(120)
+plot_longitudinal_samples(longMCIdata,LMM_ADNI_LAN,35)
+
+emm_long_LAN$emtrends %>% as_tibble() %>% kable(caption="Slope of ADNI-LAN over time (yr)")
+
+
+```
+
+Again, the highest bin has a very pronounced downward trend (-0.4 per year) in language assessed by ADNI-LAN. This is also seen in the plot.
+
+## Longitudinal ADNI-VS 
+
+```{r,warning=FALSE,message=FALSE}
+#LMM_ADNI_VS = fit_longitudinal_GAM(ADNI_VS,longMCIdata)
+#saveRDS(LMM_ADNI_VS,file="LMM_ADNI_VS.rdata")
+LMM_ADNI_VS = readRDS("LMM_ADNI_VS.rdata")
+emm_long_VS = emtrends(LMM_ADNI_VS,pairwise~BinAD,var="Time",adjust="none")
+comps_long_VS = as_tibble(emm_long_VS$contrasts) %>% mutate(response="ADNI_VS",type="TimeSlope")
+
+set.seed(130)
+plot_longitudinal_samples(longMCIdata,LMM_ADNI_VS,35)
+
+emm_long_VS$emtrends %>% as_tibble() %>% kable(caption="Slope of ADNI-VS over time (yr)")
+
+```
+
+Visuospatial functioning assessed by ADNI-VS also has a faster decline in the higher bin. 
+
+## Longitudinal MMSE Errors 
+
+Recall in this case, higher is worse as this is the change in the number of MMSE errors per year. A negative binomial mixed GAM was used here.  
+
+
+```{r,warning=FALSE,message=FALSE}
+
+#NBGLMM_revMMSE = fit_longitudinal_GAM(revMMSE,longMCIdata,family=nb)
+#saveRDS(NBGLMM_revMMSE,file="NBGLMM_revMMSE.rdata")
+NBGLMM_revMMSE = readRDS("NBGLMM_revMMSE.rdata")
+emm_long_revMMSE = emtrends(NBGLMM_revMMSE,pairwise~BinAD,var="Time",adjust="none")
+comps_long_revMMSE = as_tibble(emm_long_revMMSE$contrasts) %>% mutate(response="revMMSE",type="TimeSlope")
+
+set.seed(140)
+plot_longitudinal_samples(longMCIdata,NBGLMM_revMMSE,35)
+
+emm_long_revMMSE$emtrends %>% as_tibble() %>% kable(caption="Slope of MMSE Errors over time (yr)")
+
+
+```
+
+In this case, the model fit (as a result of the random effects, as well as penalization of the fixed effects in the mixed GAM from mgcv) per patient appears to be highly regularized toward the mean, hence the slopes are somewhat diluted based on the plot. 
+
+In the mean results, there is an increase in the error rate with the bin. 
+
+# Overall FDR Corrected Comparisons 
+
+Overall, we have seen that a higher predicted and binned P(AD) based on the lipid and MRI features from Part 1 does seem to correlate with a worsening in cognitive outcome. In this section, we perform more formal contrasts between each bin, for each outcome, and both for baseline and longitudinal. This will involve a Benjamini-Yekutieli (BY) FDR correction for 100 tests. A FDR correction is chosen to instead control the false discovery rate rather than Type I error rate in order to maximize the power, as this is an exploratory data mining analysis. The overall alpha is set to by 0.05. 
+
+```{r}
+
+Baseline_Comps = bind_rows(comp_EF,comp_LAN,comp_VS,comp_revMMSE)
+Longitudinal_comps = bind_rows(comps_long_MEM,comps_long_EF,comps_long_LAN,comps_long_VS,comps_long_revMMSE)
+all_comps = bind_rows(Baseline_Comps,Longitudinal_comps)
+all_comps$pFDR_BY = p.adjust(all_comps$p.value,method="BY")
+
+sig_comps = all_comps %>% filter(pFDR_BY <= 0.05)
+
+kable(sig_comps,caption="Significant Contrasts after BY FDR Correction for 100 tests")
+
+```
+
+From the above, we see thatthe MMSE errors (revMMSE=30-MMSE) between the lowest [0,0.2) and second highest [0.6,0.8) bin was the only statistically significant difference at Baseline, with a corrected p value of $p\approx0.023$. 
+
+All other significant contrasts occur in the slopes over time, though none are seen for the MMSE errors (likely due to the regularization dampening the effect above). Within those, it appears that most of the statistically significant differences were seen in ADNI-LAN, indicating that differences in language processing are seen between the probability bins. Many of the statistically significant differences over time occur between the lowest [0,0.2) group and [0.6,0.8) or [0.8,1) group, which was also the difference most clearly visible in the line plots. 
+
+Now, the next step is to assess the goodness of fit of each model. 
+
+## Goodness of Fit (Pseudo Adj $R^{2}$)
+
+We can assess goodness of fit to this sample using the pseudo adjusted $R^{2}$ metric reported by mgcv gam(). 
+
+```{r}
+
+get_R2 = function(modelname){
+  modelname = enexpr(modelname)
+  modelname_char = deparse(modelname)
+  
+  modsummary = summary(eval(modelname))
+  R2 = modsummary$r.sq
+  return(tibble("Model"=modelname_char,"PseudoAdjR2"=R2))
+}
+
+```
+
+
+```{r}
+
+model_names = syms(c("Base_ADNI_EF","Base_ADNI_LAN","Base_ADNI_MEM","Base_ADNI_VS","Base_revMMSE",
+                     "LMM_ADNI_EF","LMM_ADNI_LAN","LMM_ADNI_MEM","LMM_ADNI_VS","NBGLMM_revMMSE"))
+
+AdjR2_results = map_dfr(model_names,get_R2)
+
+kable(AdjR2_results,caption="Pseudo Adj R2 for each of the models")
+```
+
+From the above, it is apparent that the baseline models have a very poor fit to the data. This also explains why only the MMSE comparison was significant, as the data may be too noisy at baseline. However, the longitudinal models have a high pseudo adjusted R2 (for what it is worth based on mgcv gam()). This indicates that the fitted mixed GAMs appear to explain the overall patient level trends relatively well, and we can have more faith in the conclusions above. 
+
+# Conclusion 
+
+In summary, in Part 1 we explored different L2 regularized logistic regressions to predict AD from CN as well as the probabilities from a set of lipidomic and MRI volume features. It was found that log transforming these features (and scaling them after) gave the best classification performance. However, the pseudo R2 with this model (and the others) was still low at roughly 0.3-0.4, indicating that the exact probability of AD may be harder to model than classify. Thus we had adopted a binning approach where probabilities were binned in 5 intervals spaced by 0.2 in order to lessen the effects of noise in the exact probabilities. Now, in part 2, we find that there is an overall trend of cognitive outcome worsening over time in the higher P(AD) bins as compared to the lowest. The results from this analysis could be used to identify LMCI patients at risk for developing AD in order to intervene earlier on. It also shows that the signs of AD can appear almost 10-14 years in advance. 
+
+
